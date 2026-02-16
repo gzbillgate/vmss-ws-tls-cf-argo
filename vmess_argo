@@ -2,8 +2,8 @@
 
 #=============================================================================
 #  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
-#  版本：v3.1 (完整修复版)
-#  修复：卸载确认/域名解析/Token 解析/域名验证
+#  版本：v3.2 (Service 路径修复版)
+#  修复：Service 配置路径/清理旧配置/卸载 Drop-In
 #=============================================================================
 
 RED='\033[0;31m'
@@ -14,7 +14,7 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="3.1"
+SCRIPT_VERSION="3.2"
 XRAY_VERSION=""
 CF_VERSION=""
 UUID=""
@@ -83,7 +83,23 @@ detect_package_manager() {
     fi
 }
 
-# 【修复】正确解析配置文件
+# 【修复】清理旧配置冲突
+cleanup_old_config() {
+    log_progress "清理旧配置..."
+    
+    # 删除官方脚本的 Drop-In 配置
+    rm -f /etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf 2>/dev/null
+    rmdir /etc/systemd/system/xray.service.d 2>/dev/null || true
+    
+    # 删除旧路径配置
+    rm -rf /usr/local/etc/xray 2>/dev/null || true
+    
+    # 确保新路径存在
+    mkdir -p /etc/xray /var/log/xray
+    
+    log_success "旧配置清理完成"
+}
+
 check_installation_status() {
     XRAY_INSTALLED=false; CF_INSTALLED=false; XRAY_RUNNING=false; CF_RUNNING=false
     
@@ -98,7 +114,6 @@ check_installation_status() {
         WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' /etc/xray/config.json 2>/dev/null | tr -d '/' || echo "")
     fi
     
-    # 【修复】使用 sed 正确解析 hostname
     if [ -f /etc/cloudflared/config.yml ]; then
         CF_DOMAIN=$(sed -n 's/.*hostname:[[:space:]]*//p' /etc/cloudflared/config.yml 2>/dev/null | head -1 | tr -d '[:space:]')
         TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null | tr -d '[:space:]' || echo "")
@@ -201,26 +216,21 @@ generate_uuid() {
     fi
 }
 
-# 【修复】正确解析 JWT Token（使用 "t" 字段）
 extract_tunnel_id_from_token() {
     local TOKEN=$1
     local TUNNEL_ID=""
     
     local PAYLOAD=$(echo "$TOKEN" | cut -d'.' -f2)
-    
     local MOD=$((4 - ${#PAYLOAD} % 4))
     [ $MOD -ne 4 ] && PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $MOD))"
-    
     PAYLOAD=$(echo "$PAYLOAD" | tr '_-' '/+')
-    
     local DECODED=$(echo "$PAYLOAD" | base64 -d 2>/dev/null)
-    
-    # Cloudflare Token 结构：{"a":"account","t":"tunnel_id","s":"secret"}
     TUNNEL_ID=$(echo "$DECODED" | grep -oP '"t"\s*:\s*"\K[a-f0-9-]+' | head -1)
     
     echo "$TUNNEL_ID"
 }
 
+# 【修复】创建无 TLS 的 Xray 配置（Cloudflare 已处理 TLS）
 create_xray_config() {
     log_step "创建 Xray 配置文件..."
     cat > /etc/xray/config.json << EOF
@@ -233,6 +243,7 @@ create_xray_config() {
     "inbounds": [
         {
             "port": ${XRAY_PORT},
+            "listen": "127.0.0.1",
             "protocol": "vmess",
             "settings": {
                 "clients": [
@@ -242,8 +253,7 @@ create_xray_config() {
                         "email": "user@vmess.local",
                         "level": 1
                     }
-                ],
-                "disableInsecureEncryption": false
+                ]
             },
             "streamSettings": {
                 "network": "ws",
@@ -381,16 +391,36 @@ no-autoupdate: true
 
 ingress:
   - hostname: ${CF_DOMAIN}
-    service: http://localhost:${XRAY_PORT}
+    service: http://127.0.0.1:${XRAY_PORT}
   - service: http_status:404
 EOF
     
     log_success "cloudflared 配置文件创建完成"
 }
 
+# 【修复】Service 文件使用正确路径
 create_systemd_services() {
     log_step "创建 systemd 服务..."
     
+    # Xray Service - 使用 /etc/xray/config.json
+    cat > /etc/systemd/system/xray.service << EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Cloudflared Service
     if [ -n "$TUNNEL_TOKEN" ]; then
         cat > /etc/systemd/system/cloudflared.service << EOF
 [Unit]
@@ -427,23 +457,6 @@ WantedBy=multi-user.target
 EOF
     fi
     
-    cat > /etc/systemd/system/xray.service << EOF
-[Unit]
-Description=Xray Service
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
     systemctl daemon-reload
     systemctl enable xray >/dev/null 2>&1 || true
     systemctl enable cloudflared >/dev/null 2>&1 || true
@@ -473,6 +486,9 @@ start_services() {
         log_success "所有服务启动成功"
     else
         log_warn "部分服务启动失败，请检查日志"
+        echo ""
+        echo "  查看 Xray 日志：journalctl -u xray -n 20"
+        echo "  查看 Tunnel 日志：journalctl -u cloudflared -n 20"
     fi
 }
 
@@ -549,8 +565,8 @@ view_logs() {
     read LOG_OPTION
     
     case $LOG_OPTION in
-        1) tail -20 /var/log/xray/access.log 2>/dev/null || echo "日志不存在" ;;
-        2) journalctl -u cloudflared -n 20 --no-pager 2>/dev/null || echo "日志不可用" ;;
+        1) journalctl -u xray -n 30 --no-pager ;;
+        2) journalctl -u cloudflared -n 30 --no-pager ;;
         3) tail -20 /var/log/xray/error.log 2>/dev/null || echo "日志不存在" ;;
         4) return ;;
         *) log_warn "无效选项" ;;
@@ -583,7 +599,7 @@ update_components() {
     read
 }
 
-# 【修复】卸载支持 y/yes，明确提示成功
+# 【修复】卸载时清理 Drop-In 配置
 uninstall_all() {
     echo ""
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -593,37 +609,38 @@ uninstall_all() {
     echo -n "  确定要卸载吗？(输入 y 或 yes 确认): "
     read CONFIRM
     
-    # 【修复】支持 y 或 yes
     if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ] && [ "$CONFIRM" != "yes" ]; then
         log_info "取消卸载"
         return
     fi
     
     log_step "开始卸载..."
-    echo "  [1/6] 停止服务..."
+    echo "  [1/7] 停止服务..."
     systemctl stop cloudflared xray 2>/dev/null || true
     
-    echo "  [2/6] 禁用服务..."
+    echo "  [2/7] 禁用服务..."
     systemctl disable cloudflared xray 2>/dev/null || true
     
-    echo "  [3/6] 删除服务文件..."
+    echo "  [3/7] 删除服务文件..."
     rm -f /etc/systemd/system/{xray,cloudflared}.service
+    rm -f /etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf 2>/dev/null
+    rmdir /etc/systemd/system/xray.service.d 2>/dev/null || true
     
-    echo "  [4/6] 删除程序文件..."
+    echo "  [4/7] 删除程序文件..."
     rm -f /usr/local/bin/{xray,xray-core,cloudflared}
     
-    echo "  [5/6] 删除配置目录..."
-    rm -rf /etc/{xray,cloudflared} /var/log/{xray,cloudflared}
+    echo "  [5/7] 删除配置目录..."
+    rm -rf /etc/{xray,cloudflared} /var/log/{xray,cloudflared} /usr/local/etc/xray
     
-    echo "  [6/6] 清理认证信息..."
+    echo "  [6/7] 清理认证信息..."
     rm -rf ~/.cloudflared
     
+    echo "  [7/7] 重新加载 systemd..."
     systemctl daemon-reload
     
     echo ""
-    # 【修复】明确提示卸载成功
     log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_success "        卸载完成！"
+    log_success "              卸载完成！"
     log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo -e "${YELLOW}以下项目需要手动清理:${NC}"
@@ -636,7 +653,7 @@ uninstall_all() {
     read
 }
 
-# 【修复】添加域名验证
+# 【修复】部署前清理旧配置
 full_deploy() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -658,7 +675,6 @@ full_deploy() {
     echo -n "  Cloudflare 域名 (例如：app.example.com): "
     read CF_DOMAIN
     
-    # 【修复】验证域名不能为空
     if [ -z "$CF_DOMAIN" ]; then
         log_error "域名不能为空"
         return
@@ -685,6 +701,7 @@ full_deploy() {
     
     detect_system
     detect_package_manager
+    cleanup_old_config
     install_dependencies
     install_xray
     install_cloudflared
@@ -698,8 +715,8 @@ full_deploy() {
     
     create_tunnel
     create_cloudflared_config
-    configure_dns
     create_systemd_services
+    configure_dns
     start_services
     
     show_config
