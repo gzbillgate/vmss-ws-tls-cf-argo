@@ -2,8 +2,8 @@
 
 #=============================================================================
 #  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
-#  版本：v2.9 (Token 认证版)
-#  特点：支持 Token 认证，无需浏览器
+#  版本：v3.0 (Token 解析修复版)
+#  修复：正确从 JWT Token 中提取 Tunnel ID
 #=============================================================================
 
 RED='\033[0;31m'
@@ -14,7 +14,7 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="2.9"
+SCRIPT_VERSION="3.0"
 XRAY_VERSION=""
 CF_VERSION=""
 UUID=""
@@ -119,7 +119,6 @@ install_xray() {
     [ -z "$LATEST_VERSION" ] || ! echo "$LATEST_VERSION" | grep -qE '^v[0-9]+' && LATEST_VERSION="v26.2.6"
     
     log_info "使用版本：$LATEST_VERSION"
-    
     local FILENAME="Xray-linux-${ARCH}.zip"
     local DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${FILENAME}"
     
@@ -130,38 +129,26 @@ install_xray() {
     )
     
     local DOWNLOAD_SUCCESS=false
-    
     for URL in "${MIRRORS[@]}"; do
         log_progress "尝试：$URL"
         rm -f xray.zip
-        
         if curl -sL --connect-timeout 30 --max-time 90 -o xray.zip "$URL" 2>/dev/null; then
-            if [ -s xray.zip ]; then
-                if unzip -t xray.zip >/dev/null 2>&1; then
-                    log_success "下载成功"
-                    DOWNLOAD_SUCCESS=true
-                    break
-                else
-                    log_warn "文件损坏，尝试其他源..."
-                fi
+            if [ -s xray.zip ] && unzip -t xray.zip >/dev/null 2>&1; then
+                log_success "下载成功"
+                DOWNLOAD_SUCCESS=true
+                break
             fi
         fi
     done
     
-    if [ "$DOWNLOAD_SUCCESS" = false ]; then
-        log_error "所有下载源都失败"
-        exit 1
-    fi
+    [ "$DOWNLOAD_SUCCESS" = false ] && { log_error "所有下载源都失败"; exit 1; }
     
     log_progress "解压安装..."
     unzip -q -o xray.zip
     mkdir -p /etc/xray /var/log/xray
-    
     chmod +x xray 2>/dev/null || true
     mv -f xray /usr/local/bin/xray 2>/dev/null || true
-    [ -f xray-core ] && chmod +x xray-core 2>/dev/null || true
-    [ -f xray-core ] && mv -f xray-core /usr/local/bin/xray-core 2>/dev/null || true
-    
+    [ -f xray-core ] && { chmod +x xray-core 2>/dev/null || true; mv -f xray-core /usr/local/bin/xray-core 2>/dev/null || true; }
     mv -f geoip.dat /etc/xray/ 2>/dev/null || true
     mv -f geosite.dat /etc/xray/ 2>/dev/null || true
     rm -f xray.zip
@@ -172,7 +159,6 @@ install_xray() {
 
 install_cloudflared() {
     log_step "安装 cloudflared..."
-    
     case $ARCH in
         64) CF_ARCH="amd64" ;;
         arm64) CF_ARCH="arm64" ;;
@@ -197,7 +183,6 @@ install_cloudflared() {
             fi
         fi
     done
-    
     log_error "cloudflared 下载失败"
     exit 1
 }
@@ -210,6 +195,35 @@ generate_uuid() {
     else
         cat /proc/sys/kernel/random/uuid
     fi
+}
+
+# 【修复】正确解析 JWT Token 获取 Tunnel ID
+extract_tunnel_id_from_token() {
+    local TOKEN=$1
+    local TUNNEL_ID=""
+    
+    # JWT Token 格式：header.payload.signature
+    # payload 部分包含 tunnel_id
+    local PAYLOAD=$(echo "$TOKEN" | cut -d'.' -f2)
+    
+    # 添加 padding（base64 URL safe）
+    local MOD=$((4 - ${#PAYLOAD} % 4))
+    if [ $MOD -ne 4 ]; then
+        PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $MOD))"
+    fi
+    
+    # 替换 URL safe 字符
+    PAYLOAD=$(echo "$PAYLOAD" | tr '_-' '/+')
+    
+    # 解码并提取 tunnel_id
+    local DECODED=$(echo "$PAYLOAD" | base64 -d 2>/dev/null)
+    
+    # 尝试多种字段名
+    TUNNEL_ID=$(echo "$DECODED" | grep -oP '"tunnel_id"\s*:\s*"\K[a-f0-9-]+' | head -1)
+    [ -z "$TUNNEL_ID" ] && TUNNEL_ID=$(echo "$DECODED" | grep -oP '"tun"\s*:\s*"\K[a-f0-9-]+' | head -1)
+    [ -z "$TUNNEL_ID" ] && TUNNEL_ID=$(echo "$DECODED" | grep -oP '"id"\s*:\s*"\K[a-f0-9-]+' | head -1)
+    
+    echo "$TUNNEL_ID"
 }
 
 create_xray_config() {
@@ -273,7 +287,7 @@ EOF
     log_success "Xray 配置文件创建完成"
 }
 
-# 【修复】使用 Token 认证，无需浏览器
+# 【修复】Token 认证，正确提取 Tunnel ID
 cloudflare_auth_token() {
     log_step "Cloudflare Token 认证..."
     echo ""
@@ -282,11 +296,9 @@ cloudflare_auth_token() {
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo "  获取 Token 步骤："
-    echo "  1. 访问 Cloudflare Zero Trust: https://one.dash.cloudflare.com/"
-    echo "  2. 进入 Access → Tunnels"
-    echo "  3. 创建新 Tunnel"
-    echo "  4. 选择 your operating system"
-    echo "  5. 复制 Token（以 eyJ 开头的长字符串）"
+    echo "  1. 访问：https://one.dash.cloudflare.com/"
+    echo "  2. Access → Tunnels → Create a tunnel"
+    echo "  3. 复制 Token（以 eyJ 开头的长字符串）"
     echo ""
     echo -n "  请输入 Token: "
     read TUNNEL_TOKEN
@@ -301,23 +313,21 @@ cloudflare_auth_token() {
     echo "$TUNNEL_TOKEN" > /etc/cloudflared/token
     chmod 600 /etc/cloudflared/token
     
-    # 使用 Token 创建隧道配置
-    log_progress "配置隧道..."
-    /usr/local/bin/cloudflared service install "$TUNNEL_TOKEN" 2>/dev/null || {
-        # 如果 service install 失败，手动配置
-        log_warn "service install 失败，使用手动配置"
-        
-        # 从 token 中提取 tunnel ID
-        TUNNEL_ID=$(echo "$TUNNEL_TOKEN" | base64 -d 2>/dev/null | grep -oP '"tunnel_id":"\K[a-f0-9-]+' || echo "")
-        
-        if [ -z "$TUNNEL_ID" ]; then
-            # 尝试另一种方式获取
-            TUNNEL_ID=$(echo "$TUNNEL_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | grep -oP 'tunnel_id.*?' | head -1 || echo "")
-        fi
-        
+    # 提取 Tunnel ID
+    log_progress "解析 Token..."
+    TUNNEL_ID=$(extract_tunnel_id_from_token "$TUNNEL_TOKEN")
+    
+    if [ -n "$TUNNEL_ID" ]; then
         echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
-        log_info "Tunnel ID: $TUNNEL_ID"
-    }
+        log_success "Tunnel ID: $TUNNEL_ID"
+    else
+        log_warn "无法从 Token 中提取 Tunnel ID，请在 Cloudflare 后台查看"
+        echo ""
+        echo "  请手动输入 Tunnel ID（可选）："
+        echo -n "  Tunnel ID: "
+        read MANUAL_ID
+        [ -n "$MANUAL_ID" ] && echo "$MANUAL_ID" > /etc/cloudflared/tunnel-id && TUNNEL_ID=$MANUAL_ID
+    fi
     
     log_success "Token 认证完成"
 }
@@ -325,7 +335,7 @@ cloudflare_auth_token() {
 cloudflare_auth_browser() {
     log_step "Cloudflare 浏览器认证..."
     echo ""
-    echo "  即将运行认证命令，会自动打开浏览器或输出 URL..."
+    echo "  即将运行认证命令..."
     echo ""
     echo -n "  按回车键继续..."
     read
@@ -344,7 +354,6 @@ cloudflare_auth_browser() {
 create_tunnel() {
     log_step "创建 Cloudflare 隧道..."
     
-    # 如果已有 token，不需要创建隧道
     if [ -n "$TUNNEL_TOKEN" ]; then
         log_info "使用 Token 配置，跳过隧道创建"
         return 0
@@ -371,9 +380,7 @@ create_cloudflared_config() {
     log_step "创建 cloudflared 配置文件..."
     mkdir -p /etc/cloudflared
     
-    # 如果有 token，使用 token 方式
-    if [ -n "$TUNNEL_TOKEN" ]; then
-        cat > /etc/cloudflared/config.yml << EOF
+    cat > /etc/cloudflared/config.yml << EOF
 tunnel: ${TUNNEL_ID}
 credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
 
@@ -385,20 +392,6 @@ ingress:
     service: http://localhost:${XRAY_PORT}
   - service: http_status:404
 EOF
-    else
-        cat > /etc/cloudflared/config.yml << EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
-
-metrics: 0.0.0.0:2000
-no-autoupdate: true
-
-ingress:
-  - hostname: ${CF_DOMAIN}
-    service: http://localhost:${XRAY_PORT}
-  - service: http_status:404
-EOF
-    fi
     
     log_success "cloudflared 配置文件创建完成"
 }
@@ -406,7 +399,6 @@ EOF
 create_systemd_services() {
     log_step "创建 systemd 服务..."
     
-    # 如果有 token，使用 token 方式启动
     if [ -n "$TUNNEL_TOKEN" ]; then
         cat > /etc/systemd/system/cloudflared.service << EOF
 [Unit]
