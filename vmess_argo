@@ -2,8 +2,8 @@
 
 #=============================================================================
 #  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
-#  版本：v2.2 (下载修复版)
-#  修复：GitHub 下载重定向问题、文件验证
+#  版本：v2.5 (文件名修复版)
+#  修复：Xray-core 下载文件名正确映射
 #=============================================================================
 
 set -e
@@ -15,11 +15,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
 NC='\033[0m'
 
 # 全局变量
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.5"
 XRAY_VERSION=""
 CF_VERSION=""
 UUID=""
@@ -37,22 +36,16 @@ log_step() { echo -e "${BLUE}[➤ STEP]${NC} $1"; }
 log_success() { echo -e "${GREEN}[✓ SUCCESS]${NC} $1"; }
 log_progress() { echo -e "${CYAN}[...]${NC} $1"; }
 
-# 显示横幅
 show_banner() {
     clear
     echo -e "${PURPLE}"
     echo "╔═══════════════════════════════════════════════════════════╗"
-    echo "║                                                           ║"
     echo "║     Xray + Cloudflare Argo Tunnel 一键部署管理系统        ║"
-    echo "║                                                           ║"
     echo "║                        版本：${SCRIPT_VERSION}                    ║"
-    echo "║                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo ""
 }
 
-# 检测 root 权限
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         log_error "请使用 root 用户运行此脚本"
@@ -60,32 +53,38 @@ check_root() {
     fi
 }
 
-# 检测系统信息
+# 【修复】正确的架构映射
 detect_system() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        OS=$ID
-        VERSION=$VERSION_ID
         OS_PRETTY=$PRETTY_NAME
     else
-        OS="unknown"
         OS_PRETTY="Unknown"
     fi
     
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
-        armv7l) ARCH="arm" ;;
-        *) log_error "不支持的架构：$ARCH"; exit 1 ;;
+    ARCH_RAW=$(uname -m)
+    case $ARCH_RAW in
+        x86_64)
+            ARCH="64"
+            ARCH_NAME="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ARCH_NAME="arm64"
+            ;;
+        armv7l|armv7)
+            ARCH="arm32-v7a"
+            ARCH_NAME="arm"
+            ;;
+        *)
+            log_error "不支持的架构：$ARCH_RAW"
+            exit 1
+            ;;
     esac
     
-    KERNEL=$(uname -r)
-    log_info "系统：$OS_PRETTY"
-    log_info "架构：$ARCH, 内核：$KERNEL"
+    log_info "系统：$OS_PRETTY | 架构：$ARCH_RAW ($ARCH)"
 }
 
-# 检测包管理器
 detect_package_manager() {
     if command -v apt &> /dev/null; then
         PM="apt"
@@ -99,213 +98,144 @@ detect_package_manager() {
         PM="dnf"
         PM_UPDATE="dnf update -y"
         PM_INSTALL="dnf install -y"
-    elif command -v apk &> /dev/null; then
-        PM="apk"
-        PM_UPDATE="apk update"
-        PM_INSTALL="apk add"
     else
         log_error "未检测到支持的包管理器"
         exit 1
     fi
-    log_info "包管理器：$PM"
 }
 
-# 检查已安装状态
 check_installation_status() {
     XRAY_INSTALLED=false
     CF_INSTALLED=false
     XRAY_RUNNING=false
     CF_RUNNING=false
     
-    if [ -f /usr/local/bin/xray ]; then
-        XRAY_INSTALLED=true
-        XRAY_VERSION=$(/usr/local/bin/xray version 2>/dev/null | head -1 || echo "未知版本")
-    fi
+    [ -f /usr/local/bin/xray ] && XRAY_INSTALLED=true && XRAY_VERSION=$(/usr/local/bin/xray version 2>/dev/null | head -1 || echo "未知")
+    [ -f /usr/local/bin/cloudflared ] && CF_INSTALLED=true && CF_VERSION=$(/usr/local/bin/cloudflared version 2>/dev/null || echo "未知")
+    systemctl is-active --quiet xray 2>/dev/null && XRAY_RUNNING=true
+    systemctl is-active --quiet cloudflared 2>/dev/null && CF_RUNNING=true
     
-    if [ -f /usr/local/bin/cloudflared ]; then
-        CF_INSTALLED=true
-        CF_VERSION=$(/usr/local/bin/cloudflared version 2>/dev/null | grep -oP 'version [\d.]+' || echo "未知版本")
-    fi
-    
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        XRAY_RUNNING=true
-    fi
-    
-    if systemctl is-active --quiet cloudflared 2>/dev/null; then
-        CF_RUNNING=true
-    fi
-    
-    if [ -f /etc/xray/config.json ]; then
+    [ -f /etc/xray/config.json ] && {
         UUID=$(jq -r '.inbounds[0].settings.clients[0].id' /etc/xray/config.json 2>/dev/null || echo "")
         XRAY_PORT=$(jq -r '.inbounds[0].port' /etc/xray/config.json 2>/dev/null || echo "")
         WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' /etc/xray/config.json 2>/dev/null | tr -d '/' || echo "")
-    fi
-    
-    if [ -f /etc/cloudflared/config.yml ]; then
+    }
+    [ -f /etc/cloudflared/config.yml ] && {
         CF_DOMAIN=$(grep -oP 'hostname: \K[^ ]+' /etc/cloudflared/config.yml 2>/dev/null | head -1 || echo "")
         TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null || echo "")
-    fi
+    }
 }
 
-# 安装依赖
 install_dependencies() {
     log_step "安装系统依赖..."
-    case $PM in
-        apt)
-            $PM_UPDATE >/dev/null 2>&1
-            $PM_INSTALL curl wget jq tar gzip unzip socat uuid-runtime >/dev/null 2>&1
-            ;;
-        yum|dnf)
-            $PM_UPDATE >/dev/null 2>&1
-            $PM_INSTALL curl wget jq tar gzip unzip socat util-linux >/dev/null 2>&1
-            ;;
-        apk)
-            $PM_UPDATE >/dev/null 2>&1
-            $PM_INSTALL curl wget jq tar gzip unzip socat >/dev/null 2>&1
-            ;;
-    esac
+    $PM_UPDATE >/dev/null 2>&1
+    $PM_INSTALL curl wget jq tar gzip unzip socat uuid-runtime >/dev/null 2>&1
     log_success "依赖安装完成"
 }
 
-# 验证下载的文件
-validate_file() {
-    local FILE=$1
-    local EXPECTED_TYPE=$2
-    
-    if [ ! -f "$FILE" ]; then
-        return 1
-    fi
-    
-    if [ ! -s "$FILE" ]; then
-        return 1
-    fi
-    
-    # 检查是否是 HTML（下载失败）
-    if head -c 20 "$FILE" | grep -qi "<!DOCTYPE\|<html"; then
-        return 1
-    fi
-    
-    # 检查文件类型
-    local FILE_TYPE=$(file -b "$FILE" 2>/dev/null)
-    
-    if [ "$EXPECTED_TYPE" = "zip" ]; then
-        if echo "$FILE_TYPE" | grep -qi "Zip\|zip"; then
-            return 0
-        else
-            return 1
-        fi
-    else
-        if [ -x "$FILE" ]; then
-            return 0
-        fi
-        return 1
-    fi
-}
-
-# 安装 Xray-core
+# 【修复】正确的下载文件名
 install_xray() {
     log_step "安装 Xray-core..."
     cd /tmp
     
-    # 获取最新版本号
+    # 获取最新版本
     log_progress "获取最新版本..."
-    XRAY_LATEST=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-    if [ -z "$XRAY_LATEST" ]; then
-        XRAY_LATEST="v2.25.1"  #  fallback 版本
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | grep '"tag_name"' | cut -d'"' -f4)
+    
+    if ! echo "$LATEST_VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        log_warn "API 返回版本号格式异常，使用 v26.2.6"
+        LATEST_VERSION="v26.2.6"
     fi
-    log_info "最新版本：$XRAY_LATEST"
     
-    # 下载 URL
-    local DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_LATEST}/Xray-linux-${ARCH}.zip"
+    log_info "使用版本：$LATEST_VERSION"
     
-    # 尝试多个下载源
+    # 【修复】正确的文件名格式
+    local FILENAME="Xray-linux-${ARCH}.zip"
+    local DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${FILENAME}"
+    
+    log_info "下载文件：$FILENAME"
+    
+    # 多镜像源
     local MIRRORS=(
         "$DOWNLOAD_URL"
-        "https://mirror.ghproxy.com/https://github.com/XTLS/Xray-core/releases/download/${XRAY_LATEST}/Xray-linux-${ARCH}.zip"
+        "https://mirror.ghproxy.com/https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${FILENAME}"
+        "https://ghproxy.com/https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${FILENAME}"
     )
     
-    local DOWNLOADED=false
+    local DOWNLOAD_SUCCESS=false
     
-    for MIRROR in "${MIRRORS[@]}"; do
-        log_progress "尝试下载：$MIRROR"
-        
+    for URL in "${MIRRORS[@]}"; do
+        log_progress "尝试：$URL"
         rm -f xray.zip
         
-        if wget -q --show-progress -T 60 -t 2 -O xray.zip "$MIRROR" 2>/dev/null; then
-            if validate_file "xray.zip" "zip"; then
-                log_success "下载成功"
-                DOWNLOADED=true
-                break
-            else
-                log_warn "文件验证失败，尝试其他源..."
+        if curl -sL --connect-timeout 30 --max-time 90 -o xray.zip "$URL" 2>/dev/null; then
+            if [ -s xray.zip ]; then
+                if unzip -t xray.zip >/dev/null 2>&1; then
+                    log_success "下载成功"
+                    DOWNLOAD_SUCCESS=true
+                    break
+                else
+                    log_warn "文件损坏，尝试其他源..."
+                fi
             fi
         fi
     done
     
-    if [ "$DOWNLOADED" = false ]; then
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
         log_error "所有下载源都失败"
-        log_error "请手动下载：$DOWNLOAD_URL"
+        log_error "请手动下载："
+        log_error "curl -L -o /tmp/xray.zip $DOWNLOAD_URL"
         exit 1
     fi
     
-    # 解压
-    log_progress "解压文件..."
+    # 解压安装
+    log_progress "解压安装..."
     unzip -q -o xray.zip
-    
-    # 创建目录
     mkdir -p /etc/xray /var/log/xray
-    
-    # 安装
     chmod +x xray xray-core
     mv -f xray /usr/local/bin/
     mv -f xray-core /usr/local/bin/
     mv -f geoip.dat /etc/xray/ 2>/dev/null || true
     mv -f geosite.dat /etc/xray/ 2>/dev/null || true
-    
-    # 清理
     rm -f xray.zip
     
-    # 验证
-    if /usr/local/bin/xray version >/dev/null 2>&1; then
-        XRAY_VERSION=$(/usr/local/bin/xray version | head -1)
-        log_success "Xray-core 安装完成：$XRAY_VERSION"
-    else
-        log_error "Xray-core 安装失败"
-        exit 1
-    fi
+    XRAY_VERSION=$(/usr/local/bin/xray version | head -1)
+    log_success "Xray-core 安装完成：$XRAY_VERSION"
 }
 
-# 安装 cloudflared
 install_cloudflared() {
     log_step "安装 cloudflared..."
     
-    local CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
-    local CF_MIRROR="https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
+    # cloudflared 使用不同的文件名格式
+    case $ARCH in
+        64) CF_ARCH="amd64" ;;
+        arm64) CF_ARCH="arm64" ;;
+        arm32-v7a) CF_ARCH="arm" ;;
+        *) CF_ARCH="amd64" ;;
+    esac
     
-    log_progress "下载 cloudflared..."
+    local CF_URLS=(
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+        "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+    )
     
-    if wget -q --show-progress -T 60 -t 2 -O /tmp/cloudflared "$CF_URL" 2>/dev/null; then
-        if [ -s /tmp/cloudflared ] && [ -x /tmp/cloudflared ]; then
-            log_success "下载成功"
-        else
-            log_warn "主源失败，尝试镜像..."
-            wget -q --show-progress -T 60 -t 2 -O /tmp/cloudflared "$CF_MIRROR" 2>/dev/null
+    for URL in "${CF_URLS[@]}"; do
+        log_progress "尝试：$URL"
+        if curl -sL --connect-timeout 30 --max-time 60 -o /tmp/cloudflared "$URL" 2>/dev/null; then
+            if [ -s /tmp/cloudflared ]; then
+                chmod +x /tmp/cloudflared
+                mv -f /tmp/cloudflared /usr/local/bin/cloudflared
+                CF_VERSION=$(/usr/local/bin/cloudflared version)
+                log_success "cloudflared 安装完成：$CF_VERSION"
+                return 0
+            fi
         fi
-    fi
+    done
     
-    chmod +x /tmp/cloudflared
-    mv -f /tmp/cloudflared /usr/local/bin/cloudflared
-    
-    if /usr/local/bin/cloudflared version >/dev/null 2>&1; then
-        CF_VERSION=$(/usr/local/bin/cloudflared version)
-        log_success "cloudflared 安装完成：$CF_VERSION"
-    else
-        log_error "cloudflared 安装失败"
-        exit 1
-    fi
+    log_error "cloudflared 下载失败"
+    exit 1
 }
 
-# 生成 UUID
 generate_uuid() {
     if command -v uuidgen &> /dev/null; then
         uuidgen | tr '[:upper:]' '[:lower:]'
@@ -316,10 +246,8 @@ generate_uuid() {
     fi
 }
 
-# 创建 Xray 配置文件
 create_xray_config() {
     log_step "创建 Xray 配置文件..."
-    
     cat > /etc/xray/config.json << EOF
 {
     "log": {
@@ -376,15 +304,12 @@ create_xray_config() {
     }
 }
 EOF
-    
     log_success "Xray 配置文件创建完成"
 }
 
-# 创建 cloudflared 配置文件
 create_cloudflared_config() {
     log_step "创建 cloudflared 配置文件..."
     mkdir -p /etc/cloudflared
-    
     cat > /etc/cloudflared/config.yml << EOF
 tunnel: ${TUNNEL_ID}
 credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
@@ -403,11 +328,9 @@ ingress:
     service: http://localhost:${XRAY_PORT}
   - service: http_status:404
 EOF
-    
     log_success "cloudflared 配置文件创建完成"
 }
 
-# 创建 systemd 服务
 create_systemd_services() {
     log_step "创建 systemd 服务..."
     
@@ -451,12 +374,11 @@ EOF
     log_success "systemd 服务创建完成"
 }
 
-# Cloudflare 认证
 cloudflare_auth() {
     log_step "Cloudflare 认证..."
     echo ""
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo "  请在浏览器中打开以下链接进行认证："
+    echo "  请在浏览器打开以下链接认证："
     echo -e "  ${BLUE}https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/run-tunnel/trycloudflare/${NC}"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
@@ -474,11 +396,8 @@ cloudflare_auth() {
     fi
 }
 
-# 创建隧道
 create_tunnel() {
     log_step "创建 Cloudflare 隧道..."
-    
-    # 先删除同名隧道（如果存在）
     /usr/local/bin/cloudflared tunnel delete "$TUNNEL_NAME" 2>/dev/null || true
     
     TUNNEL_OUTPUT=$(/usr/local/bin/cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
@@ -490,16 +409,12 @@ create_tunnel() {
     fi
     
     echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
-    
     CRED_FILE=$(echo "$TUNNEL_OUTPUT" | grep -oP '/[^ ]+\.json' | head -1)
-    if [ -f "$CRED_FILE" ]; then
-        cp "$CRED_FILE" /etc/cloudflared/${TUNNEL_ID}.json
-    fi
+    [ -f "$CRED_FILE" ] && cp "$CRED_FILE" /etc/cloudflared/${TUNNEL_ID}.json
     
     log_success "隧道创建完成：$TUNNEL_ID"
 }
 
-# 配置 DNS
 configure_dns() {
     log_step "配置 DNS 记录..."
     /usr/local/bin/cloudflared tunnel route dns "$TUNNEL_ID" "$CF_DOMAIN" 2>/dev/null || {
@@ -508,7 +423,6 @@ configure_dns() {
     log_success "DNS 记录配置完成"
 }
 
-# 启动服务
 start_services() {
     log_step "启动服务..."
     systemctl start xray
@@ -523,7 +437,6 @@ start_services() {
     fi
 }
 
-# 停止服务
 stop_services() {
     log_step "停止服务..."
     systemctl stop cloudflared 2>/dev/null || true
@@ -531,7 +444,6 @@ stop_services() {
     log_success "服务已停止"
 }
 
-# 重启服务
 restart_services() {
     log_step "重启服务..."
     systemctl restart xray
@@ -539,7 +451,6 @@ restart_services() {
     log_success "服务已重启"
 }
 
-# 显示配置信息
 show_config() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -573,7 +484,6 @@ show_config() {
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# 显示状态
 show_status() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -581,45 +491,22 @@ show_status() {
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
-    if [ "$XRAY_INSTALLED" = true ]; then
-        echo -e "  ${GREEN}✓${NC} Xray-core:     已安装 (${XRAY_VERSION})"
-    else
-        echo -e "  ${RED}✗${NC} Xray-core:     未安装"
-    fi
-    
-    if [ "$XRAY_RUNNING" = true ]; then
-        echo -e "  ${GREEN}✓${NC} Xray 服务：    运行中"
-    else
-        echo -e "  ${YELLOW}⚠${NC} Xray 服务：    未运行"
-    fi
-    
-    if [ "$CF_INSTALLED" = true ]; then
-        echo -e "  ${GREEN}✓${NC} cloudflared:   已安装 (${CF_VERSION})"
-    else
-        echo -e "  ${RED}✗${NC} cloudflared:   未安装"
-    fi
-    
-    if [ "$CF_RUNNING" = true ]; then
-        echo -e "  ${GREEN}✓${NC} Tunnel 服务：  运行中"
-    else
-        echo -e "  ${YELLOW}⚠${NC} Tunnel 服务：  未运行"
-    fi
+    [ "$XRAY_INSTALLED" = true ] && echo -e "  ${GREEN}✓${NC} Xray-core:     已安装 (${XRAY_VERSION})" || echo -e "  ${RED}✗${NC} Xray-core:     未安装"
+    [ "$XRAY_RUNNING" = true ] && echo -e "  ${GREEN}✓${NC} Xray 服务：    运行中" || echo -e "  ${YELLOW}⚠${NC} Xray 服务：    未运行"
+    [ "$CF_INSTALLED" = true ] && echo -e "  ${GREEN}✓${NC} cloudflared:   已安装 (${CF_VERSION})" || echo -e "  ${RED}✗${NC} cloudflared:   未安装"
+    [ "$CF_RUNNING" = true ] && echo -e "  ${GREEN}✓${NC} Tunnel 服务：  运行中" || echo -e "  ${YELLOW}⚠${NC} Tunnel 服务：  未运行"
     
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# 查看日志
 view_logs() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${WHITE}日志查看${NC}"
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo "  1) Xray 日志"
-    echo "  2) cloudflared 日志"
-    echo "  3) Xray 错误日志"
-    echo "  4) 返回主菜单"
+    echo "  1) Xray 日志  2) cloudflared 日志  3) Xray 错误日志  4) 返回"
     echo ""
     echo -n "  请选择 (1-4): "
     read LOG_OPTION
@@ -631,23 +518,18 @@ view_logs() {
         4) return ;;
         *) log_warn "无效选项" ;;
     esac
-    
     echo ""
     echo -n "  按回车键返回..."
     read
 }
 
-# 更新组件
 update_components() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${WHITE}组件更新${NC}"
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo "  1) 更新 Xray-core"
-    echo "  2) 更新 cloudflared"
-    echo "  3) 更新全部"
-    echo "  4) 返回主菜单"
+    echo "  1) 更新 Xray-core  2) 更新 cloudflared  3) 更新全部  4) 返回"
     echo ""
     echo -n "  请选择 (1-4): "
     read UPDATE_OPTION
@@ -659,13 +541,11 @@ update_components() {
         4) return ;;
         *) log_warn "无效选项" ;;
     esac
-    
     echo ""
     echo -n "  按回车键返回..."
     read
 }
 
-# 一键卸载
 uninstall_all() {
     echo ""
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -675,41 +555,21 @@ uninstall_all() {
     echo -n "  确定要卸载吗？(输入 yes 确认): "
     read CONFIRM
     
-    if [ "$CONFIRM" != "yes" ]; then
-        log_info "取消卸载"
-        return
-    fi
+    [ "$CONFIRM" != "yes" ] && { log_info "取消卸载"; return; }
     
-    echo ""
     log_step "开始卸载..."
-    
-    systemctl stop cloudflared 2>/dev/null || true
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable cloudflared 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    
-    rm -f /etc/systemd/system/xray.service
-    rm -f /etc/systemd/system/cloudflared.service
-    rm -f /usr/local/bin/xray
-    rm -f /usr/local/bin/xray-core
-    rm -f /usr/local/bin/cloudflared
-    rm -rf /etc/xray
-    rm -rf /etc/cloudflared
-    rm -rf /var/log/xray
-    rm -rf /var/log/cloudflared
-    rm -rf ~/.cloudflared
-    
+    systemctl stop cloudflared xray 2>/dev/null || true
+    systemctl disable cloudflared xray 2>/dev/null || true
+    rm -f /etc/systemd/system/{xray,cloudflared}.service
+    rm -f /usr/local/bin/{xray,xray-core,cloudflared}
+    rm -rf /etc/{xray,cloudflared} /var/log/{xray,cloudflared} ~/.cloudflared
     systemctl daemon-reload
-    
     log_success "卸载完成！"
-    echo ""
     echo -e "${YELLOW}请手动清理 Cloudflare 后台的 Tunnel 和 DNS 记录${NC}"
-    echo ""
     echo -n "  按回车键返回..."
     read
 }
 
-# 全新部署
 full_deploy() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -721,43 +581,25 @@ full_deploy() {
         log_warn "检测到已有组件安装"
         echo -n "  是否继续？(y/n): "
         read CONTINUE
-        if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-            return
-        fi
+        [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ] && return
     fi
     
     echo ""
     echo -e "${CYAN}请输入配置信息:${NC}"
     echo ""
-    
     echo -n "  Cloudflare 域名 (例如：app.example.com): "
     read CF_DOMAIN
-    
     echo -n "  Xray 监听端口 (默认：10000): "
-    read XRAY_PORT_INPUT
-    XRAY_PORT=${XRAY_PORT_INPUT:-10000}
-    
+    read XRAY_PORT_INPUT; XRAY_PORT=${XRAY_PORT_INPUT:-10000}
     echo -n "  WS 路径 (默认：ray): "
-    read WS_PATH_INPUT
-    WS_PATH=$(echo "$WS_PATH_INPUT" | tr -d '/' | sed 's/^$/ray/')
-    WS_PATH=${WS_PATH:-ray}
-    
+    read WS_PATH_INPUT; WS_PATH=$(echo "$WS_PATH_INPUT" | tr -d '/' | sed 's/^$/ray/')
     echo -n "  隧道名称 (默认：my-tunnel): "
-    read TUNNEL_NAME_INPUT
-    TUNNEL_NAME=${TUNNEL_NAME_INPUT:-my-tunnel}
-    
+    read TUNNEL_NAME_INPUT; TUNNEL_NAME=${TUNNEL_NAME_INPUT:-my-tunnel}
     echo -n "  UUID (留空自动生成): "
     read UUID_INPUT
-    if [ -z "$UUID_INPUT" ]; then
-        UUID=$(generate_uuid)
-        log_info "自动生成 UUID"
-    else
-        UUID=$UUID_INPUT
-    fi
+    [ -z "$UUID_INPUT" ] && { UUID=$(generate_uuid); log_info "自动生成 UUID"; } || UUID=$UUID_INPUT
     
-    echo ""
     log_step "开始部署..."
-    echo ""
     
     detect_system
     detect_package_manager
@@ -772,68 +614,32 @@ full_deploy() {
     create_systemd_services
     start_services
     
-    echo ""
     show_config
-    
     log_success "部署完成！"
-    echo ""
     echo -n "  按回车键返回..."
     read
 }
 
-# 主菜单
 main_menu() {
     while true; do
         show_banner
         check_installation_status
         
-        echo -e "  ${CYAN}系统信息:${NC}"
-        echo "    系统：$OS_PRETTY | 架构：$ARCH"
+        echo -e "  ${CYAN}系统信息:${NC}  $OS_PRETTY | $ARCH_NAME"
         echo ""
-        
         echo -e "  ${CYAN}安装状态:${NC}"
-        if [ "$XRAY_INSTALLED" = true ]; then
-            echo -e "    Xray-core:     ${GREEN}已安装${NC} ${XRAY_VERSION}"
-        else
-            echo -e "    Xray-core:     ${RED}未安装${NC}"
-        fi
-        
-        if [ "$CF_INSTALLED" = true ]; then
-            echo -e "    cloudflared:   ${GREEN}已安装${NC} ${CF_VERSION}"
-        else
-            echo -e "    cloudflared:   ${RED}未安装${NC}"
-        fi
-        
+        [ "$XRAY_INSTALLED" = true ] && echo -e "    ${GREEN}✓${NC} Xray-core: ${XRAY_VERSION}" || echo -e "    ${RED}✗${NC} Xray-core: 未安装"
+        [ "$CF_INSTALLED" = true ] && echo -e "    ${GREEN}✓${NC} cloudflared: ${CF_VERSION}" || echo -e "    ${RED}✗${NC} cloudflared: 未安装"
         echo ""
         echo -e "  ${CYAN}运行状态:${NC}"
-        if [ "$XRAY_RUNNING" = true ]; then
-            echo -e "    Xray 服务：    ${GREEN}运行中${NC}"
-        else
-            echo -e "    Xray 服务：    ${YELLOW}未运行${NC}"
-        fi
-        
-        if [ "$CF_RUNNING" = true ]; then
-            echo -e "    Tunnel 服务：  ${GREEN}运行中${NC}"
-        else
-            echo -e "    Tunnel 服务：  ${YELLOW}未运行${NC}"
-        fi
+        [ "$XRAY_RUNNING" = true ] && echo -e "    ${GREEN}✓${NC} Xray: 运行中" || echo -e "    ${YELLOW}⚠${NC} Xray: 未运行"
+        [ "$CF_RUNNING" = true ] && echo -e "    ${GREEN}✓${NC} Tunnel: 运行中" || echo -e "    ${YELLOW}⚠${NC} Tunnel: 未运行"
         
         echo ""
         echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  ${WHITE}主菜单${NC}"
-        echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo ""
-        echo "    1) 全新部署"
-        echo "    2) 查看配置"
-        echo "    3) 查看状态"
-        echo "    4) 启动服务"
-        echo "    5) 停止服务"
-        echo "    6) 重启服务"
-        echo "    7) 查看日志"
-        echo "    8) 更新组件"
-        echo "    9) 一键卸载"
-        echo "    0) 退出脚本"
-        echo ""
+        echo "    1) 全新部署   2) 查看配置   3) 查看状态   4) 启动服务"
+        echo "    5) 停止服务   6) 重启服务   7) 查看日志   8) 更新组件"
+        echo "    9) 一键卸载   0) 退出脚本"
         echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
         echo -n "  请选择 (0-9): "
@@ -855,7 +661,6 @@ main_menu() {
     done
 }
 
-# 程序入口
 main() {
     check_root
     detect_system
