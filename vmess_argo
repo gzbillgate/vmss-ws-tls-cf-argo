@@ -2,8 +2,8 @@
 
 #=============================================================================
 #  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
-#  版本：v3.0 (Token 解析修复版)
-#  修复：正确从 JWT Token 中提取 Tunnel ID
+#  版本：v3.1 (完整修复版)
+#  修复：卸载确认/域名解析/Token 解析/域名验证
 #=============================================================================
 
 RED='\033[0;31m'
@@ -14,7 +14,7 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 XRAY_VERSION=""
 CF_VERSION=""
 UUID=""
@@ -83,6 +83,7 @@ detect_package_manager() {
     fi
 }
 
+# 【修复】正确解析配置文件
 check_installation_status() {
     XRAY_INSTALLED=false; CF_INSTALLED=false; XRAY_RUNNING=false; CF_RUNNING=false
     
@@ -91,15 +92,18 @@ check_installation_status() {
     systemctl is-active --quiet xray 2>/dev/null && XRAY_RUNNING=true
     systemctl is-active --quiet cloudflared 2>/dev/null && CF_RUNNING=true
     
-    [ -f /etc/xray/config.json ] && {
+    if [ -f /etc/xray/config.json ]; then
         UUID=$(jq -r '.inbounds[0].settings.clients[0].id' /etc/xray/config.json 2>/dev/null || echo "")
         XRAY_PORT=$(jq -r '.inbounds[0].port' /etc/xray/config.json 2>/dev/null || echo "")
         WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' /etc/xray/config.json 2>/dev/null | tr -d '/' || echo "")
-    }
-    [ -f /etc/cloudflared/config.yml ] && {
-        CF_DOMAIN=$(grep 'hostname:' /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}' || echo "")
-        TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null || echo "")
-    }
+    fi
+    
+    # 【修复】使用 sed 正确解析 hostname
+    if [ -f /etc/cloudflared/config.yml ]; then
+        CF_DOMAIN=$(sed -n 's/.*hostname:[[:space:]]*//p' /etc/cloudflared/config.yml 2>/dev/null | head -1 | tr -d '[:space:]')
+        TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null | tr -d '[:space:]' || echo "")
+    fi
+    
     [ -f /etc/cloudflared/token ] && TUNNEL_TOKEN=$(cat /etc/cloudflared/token 2>/dev/null || echo "")
 }
 
@@ -197,31 +201,22 @@ generate_uuid() {
     fi
 }
 
-# 【修复】正确解析 JWT Token 获取 Tunnel ID
+# 【修复】正确解析 JWT Token（使用 "t" 字段）
 extract_tunnel_id_from_token() {
     local TOKEN=$1
     local TUNNEL_ID=""
     
-    # JWT Token 格式：header.payload.signature
-    # payload 部分包含 tunnel_id
     local PAYLOAD=$(echo "$TOKEN" | cut -d'.' -f2)
     
-    # 添加 padding（base64 URL safe）
     local MOD=$((4 - ${#PAYLOAD} % 4))
-    if [ $MOD -ne 4 ]; then
-        PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $MOD))"
-    fi
+    [ $MOD -ne 4 ] && PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $MOD))"
     
-    # 替换 URL safe 字符
     PAYLOAD=$(echo "$PAYLOAD" | tr '_-' '/+')
     
-    # 解码并提取 tunnel_id
     local DECODED=$(echo "$PAYLOAD" | base64 -d 2>/dev/null)
     
-    # 尝试多种字段名
-    TUNNEL_ID=$(echo "$DECODED" | grep -oP '"tunnel_id"\s*:\s*"\K[a-f0-9-]+' | head -1)
-    [ -z "$TUNNEL_ID" ] && TUNNEL_ID=$(echo "$DECODED" | grep -oP '"tun"\s*:\s*"\K[a-f0-9-]+' | head -1)
-    [ -z "$TUNNEL_ID" ] && TUNNEL_ID=$(echo "$DECODED" | grep -oP '"id"\s*:\s*"\K[a-f0-9-]+' | head -1)
+    # Cloudflare Token 结构：{"a":"account","t":"tunnel_id","s":"secret"}
+    TUNNEL_ID=$(echo "$DECODED" | grep -oP '"t"\s*:\s*"\K[a-f0-9-]+' | head -1)
     
     echo "$TUNNEL_ID"
 }
@@ -287,7 +282,6 @@ EOF
     log_success "Xray 配置文件创建完成"
 }
 
-# 【修复】Token 认证，正确提取 Tunnel ID
 cloudflare_auth_token() {
     log_step "Cloudflare Token 认证..."
     echo ""
@@ -308,12 +302,10 @@ cloudflare_auth_token() {
         return 1
     fi
     
-    # 保存 Token
     mkdir -p /etc/cloudflared
     echo "$TUNNEL_TOKEN" > /etc/cloudflared/token
     chmod 600 /etc/cloudflared/token
     
-    # 提取 Tunnel ID
     log_progress "解析 Token..."
     TUNNEL_ID=$(extract_tunnel_id_from_token "$TUNNEL_TOKEN")
     
@@ -321,10 +313,10 @@ cloudflare_auth_token() {
         echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
         log_success "Tunnel ID: $TUNNEL_ID"
     else
-        log_warn "无法从 Token 中提取 Tunnel ID，请在 Cloudflare 后台查看"
+        log_warn "无法从 Token 中提取 Tunnel ID"
         echo ""
-        echo "  请手动输入 Tunnel ID（可选）："
-        echo -n "  Tunnel ID: "
+        echo "  请在 Cloudflare 后台查看 Tunnel ID"
+        echo -n "  手动输入 Tunnel ID: "
         read MANUAL_ID
         [ -n "$MANUAL_ID" ] && echo "$MANUAL_ID" > /etc/cloudflared/tunnel-id && TUNNEL_ID=$MANUAL_ID
     fi
@@ -591,30 +583,60 @@ update_components() {
     read
 }
 
+# 【修复】卸载支持 y/yes，明确提示成功
 uninstall_all() {
     echo ""
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${WHITE}⚠  警告：此操作将卸载所有组件并删除配置${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -n "  确定要卸载吗？(输入 yes 确认): "
+    echo -n "  确定要卸载吗？(输入 y 或 yes 确认): "
     read CONFIRM
     
-    [ "$CONFIRM" != "yes" ] && { log_info "取消卸载"; return; }
+    # 【修复】支持 y 或 yes
+    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ] && [ "$CONFIRM" != "yes" ]; then
+        log_info "取消卸载"
+        return
+    fi
     
     log_step "开始卸载..."
+    echo "  [1/6] 停止服务..."
     systemctl stop cloudflared xray 2>/dev/null || true
+    
+    echo "  [2/6] 禁用服务..."
     systemctl disable cloudflared xray 2>/dev/null || true
+    
+    echo "  [3/6] 删除服务文件..."
     rm -f /etc/systemd/system/{xray,cloudflared}.service
+    
+    echo "  [4/6] 删除程序文件..."
     rm -f /usr/local/bin/{xray,xray-core,cloudflared}
-    rm -rf /etc/{xray,cloudflared} /var/log/{xray,cloudflared} ~/.cloudflared
+    
+    echo "  [5/6] 删除配置目录..."
+    rm -rf /etc/{xray,cloudflared} /var/log/{xray,cloudflared}
+    
+    echo "  [6/6] 清理认证信息..."
+    rm -rf ~/.cloudflared
+    
     systemctl daemon-reload
-    log_success "卸载完成！"
-    echo -e "${YELLOW}请手动清理 Cloudflare 后台的 Tunnel 和 DNS 记录${NC}"
+    
+    echo ""
+    # 【修复】明确提示卸载成功
+    log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_success "        卸载完成！"
+    log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "${YELLOW}以下项目需要手动清理:${NC}"
+    echo "  • Cloudflare Zero Trust 后台的 Tunnel"
+    echo "  • Cloudflare DNS 记录"
+    echo ""
+    echo "  访问：https://one.dash.cloudflare.com/"
+    echo ""
     echo -n "  按回车键返回..."
     read
 }
 
+# 【修复】添加域名验证
 full_deploy() {
     echo ""
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -632,8 +654,16 @@ full_deploy() {
     echo ""
     echo -e "${CYAN}请输入配置信息:${NC}"
     echo ""
+    
     echo -n "  Cloudflare 域名 (例如：app.example.com): "
     read CF_DOMAIN
+    
+    # 【修复】验证域名不能为空
+    if [ -z "$CF_DOMAIN" ]; then
+        log_error "域名不能为空"
+        return
+    fi
+    
     echo -n "  Xray 监听端口 (默认：10000): "
     read XRAY_PORT_INPUT; XRAY_PORT=${XRAY_PORT_INPUT:-10000}
     echo -n "  WS 路径 (默认：ray): "
