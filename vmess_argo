@@ -1,0 +1,888 @@
+#!/bin/bash
+
+#=============================================================================
+#  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
+#  版本：v2.0
+#  兼容：Debian/Ubuntu/CentOS/Alpine + 主流云平台
+#  功能：部署/卸载/管理/配置/日志/更新
+#=============================================================================
+
+set -e
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+# 全局变量
+SCRIPT_VERSION="2.0"
+XRAY_VERSION=""
+CF_VERSION=""
+UUID=""
+WS_PATH=""
+XRAY_PORT=""
+CF_DOMAIN=""
+TUNNEL_ID=""
+TUNNEL_NAME=""
+
+# 日志函数
+log_info() { echo -e "${GREEN}[✓ INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[⚠ WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[✗ ERROR]${NC} $1"; }
+log_step() { echo -e "${BLUE}[➤ STEP]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✓ SUCCESS]${NC} $1"; }
+
+# 显示横幅
+show_banner() {
+    clear
+    echo -e "${PURPLE}"
+    echo "╔═══════════════════════════════════════════════════════════╗"
+    echo "║                                                           ║"
+    echo "║     Xray + Cloudflare Argo Tunnel 一键部署管理系统        ║"
+    echo "║                                                           ║"
+    echo "║                        版本：${SCRIPT_VERSION}                    ║"
+    echo "║                                                           ║"
+    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo ""
+}
+
+# 检测 root 权限
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "请使用 root 用户运行此脚本"
+        echo "  使用命令: sudo $0"
+        exit 1
+    fi
+}
+
+# 检测系统信息
+detect_system() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VERSION=$VERSION_ID
+        OS_PRETTY=$PRETTY_NAME
+    elif [ -f /etc/redhat-release ]; then
+        OS="centos"
+        VERSION=$(cat /etc/redhat-release | grep -oP '\d+')
+        OS_PRETTY=$(cat /etc/redhat-release)
+    else
+        OS="unknown"
+        VERSION="unknown"
+        OS_PRETTY="Unknown"
+    fi
+    
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l) ARCH="arm" ;;
+        *) log_error "不支持的架构: $ARCH"; exit 1 ;;
+    esac
+    
+    KERNEL=$(uname -r)
+    
+    log_info "系统: $OS_PRETTY"
+    log_info "架构: $ARCH, 内核: $KERNEL"
+}
+
+# 检测包管理器
+detect_package_manager() {
+    if command -v apt &> /dev/null; then
+        PM="apt"
+        PM_UPDATE="apt update -y"
+        PM_INSTALL="apt install -y"
+        PM_REMOVE="apt remove -y --purge"
+    elif command -v yum &> /dev/null; then
+        PM="yum"
+        PM_UPDATE="yum update -y"
+        PM_INSTALL="yum install -y"
+        PM_REMOVE="yum remove -y"
+    elif command -v dnf &> /dev/null; then
+        PM="dnf"
+        PM_UPDATE="dnf update -y"
+        PM_INSTALL="dnf install -y"
+        PM_REMOVE="dnf remove -y"
+    elif command -v apk &> /dev/null; then
+        PM="apk"
+        PM_UPDATE="apk update"
+        PM_INSTALL="apk add"
+        PM_REMOVE="apk del"
+    else
+        log_error "未检测到支持的包管理器"
+        exit 1
+    fi
+    log_info "包管理器: $PM"
+}
+
+# 检查已安装状态
+check_installation_status() {
+    XRAY_INSTALLED=false
+    CF_INSTALLED=false
+    XRAY_RUNNING=false
+    CF_RUNNING=false
+    
+    if [ -f /usr/local/bin/xray ]; then
+        XRAY_INSTALLED=true
+        XRAY_VERSION=$(/usr/local/bin/xray version | head -1 | grep -oP 'Xray [\d.]+')
+    fi
+    
+    if [ -f /usr/local/bin/cloudflared ]; then
+        CF_INSTALLED=true
+        CF_VERSION=$(/usr/local/bin/cloudflared version | grep -oP 'version [\d.]+')
+    fi
+    
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        XRAY_RUNNING=true
+    fi
+    
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        CF_RUNNING=true
+    fi
+    
+    # 读取配置
+    if [ -f /etc/xray/config.json ]; then
+        UUID=$(jq -r '.inbounds[0].settings.clients[0].id' /etc/xray/config.json 2>/dev/null || echo "")
+        XRAY_PORT=$(jq -r '.inbounds[0].port' /etc/xray/config.json 2>/dev/null || echo "")
+        WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' /etc/xray/config.json 2>/dev/null || echo "")
+    fi
+    
+    if [ -f /etc/cloudflared/config.yml ]; then
+        CF_DOMAIN=$(grep -oP 'hostname: \K[^ ]+' /etc/cloudflared/config.yml 2>/dev/null | head -1 || echo "")
+        TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null || echo "")
+    fi
+}
+
+# 安装依赖
+install_dependencies() {
+    log_step "安装系统依赖..."
+    case $PM in
+        apt)
+            $PM_UPDATE >/dev/null 2>&1
+            $PM_INSTALL curl wget jq tar gzip cron socat uuid-runtime >/dev/null 2>&1
+            ;;
+        yum|dnf)
+            $PM_UPDATE >/dev/null 2>&1
+            $PM_INSTALL curl wget jq tar gzip cronie socat util-linux >/dev/null 2>&1
+            ;;
+        apk)
+            $PM_UPDATE >/dev/null 2>&1
+            $PM_INSTALL curl wget jq tar gzip util-linux socat >/dev/null 2>&1
+            ;;
+    esac
+    log_success "依赖安装完成"
+}
+
+# 安装 Xray-core
+install_xray() {
+    log_step "安装 Xray-core..."
+    
+    XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${ARCH}.zip"
+    
+    cd /tmp
+    wget -q -O xray.zip "$XRAY_URL"
+    unzip -q -o xray.zip
+    chmod +x xray xray-core
+    
+    mkdir -p /etc/xray /var/log/xray
+    
+    mv -f xray /usr/local/bin/
+    mv -f xray-core /usr/local/bin/
+    mv -f geoip.dat /etc/xray/ 2>/dev/null || true
+    mv -f geosite.dat /etc/xray/ 2>/dev/null || true
+    
+    rm -f xray.zip
+    
+    log_success "Xray-core 安装完成: $XRAY_VERSION"
+}
+
+# 安装 cloudflared
+install_cloudflared() {
+    log_step "安装 cloudflared..."
+    
+    if [ "$ARCH" = "amd64" ]; then
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    elif [ "$ARCH" = "arm64" ]; then
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    elif [ "$ARCH" = "arm" ]; then
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
+    fi
+    
+    wget -q -O /usr/local/bin/cloudflared "$CF_URL"
+    chmod +x /usr/local/bin/cloudflared
+    
+    CF_VERSION=$(/usr/local/bin/cloudflared version | grep -oP 'version [\d.]+')
+    log_success "cloudflared 安装完成: $CF_VERSION"
+}
+
+# 生成 UUID
+generate_uuid() {
+    if command -v uuidgen &> /dev/null; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    elif command -v uuid &> /dev/null; then
+        uuid | tr '[:upper:]' '[:lower:]'
+    else
+        cat /proc/sys/kernel/random/uuid
+    fi
+}
+
+# 创建 Xray 配置文件
+create_xray_config() {
+    log_step "创建 Xray 配置文件..."
+    
+    cat > /etc/xray/config.json << EOF
+{
+    "log": {
+        "loglevel": "warning",
+        "access": "/var/log/xray/access.log",
+        "error": "/var/log/xray/error.log"
+    },
+    "inbounds": [
+        {
+            "port": ${XRAY_PORT},
+            "protocol": "vmess",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "${UUID}",
+                        "alterId": 0,
+                        "email": "user@vmess.local",
+                        "level": 1
+                    }
+                ],
+                "disableInsecureEncryption": false
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                    "path": "/${WS_PATH}"
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "protocol": "blackhole",
+            "settings": {},
+            "tag": "blocked"
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "ip": ["geoip:private"],
+                "outboundTag": "blocked"
+            }
+        ]
+    }
+}
+EOF
+    
+    log_success "Xray 配置文件创建完成"
+}
+
+# 创建 cloudflared 配置文件
+create_cloudflared_config() {
+    log_step "创建 cloudflared 配置文件..."
+    
+    mkdir -p /etc/cloudflared
+    
+    cat > /etc/cloudflared/config.yml << EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+
+metrics: 0.0.0.0:2000
+no-autoupdate: true
+logfile: /var/log/cloudflared/tunnel.log
+loglevel: info
+
+ingress:
+  - hostname: ${CF_DOMAIN}
+    service: http://localhost:${XRAY_PORT}
+  - service: http_status:404
+EOF
+    
+    log_success "cloudflared 配置文件创建完成"
+}
+
+# 创建 systemd 服务
+create_systemd_services() {
+    log_step "创建 systemd 服务..."
+    
+    # Xray 服务
+    cat > /etc/systemd/system/xray.service << EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # cloudflared 服务
+    cat > /etc/systemd/system/cloudflared.service << EOF
+[Unit]
+Description=Cloudflare Tunnel Service
+After=network.target xray.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable xray >/dev/null 2>&1
+    systemctl enable cloudflared >/dev/null 2>&1
+    
+    log_success "systemd 服务创建完成"
+}
+
+# Cloudflare 认证
+cloudflare_auth() {
+    log_step "Cloudflare 认证..."
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo "  请在浏览器中打开以下链接进行认证："
+    echo -e "  ${BLUE}https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/run-tunnel/trycloudflare/${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    /usr/local/bin/cloudflared tunnel login
+    
+    if [ -f ~/.cloudflared/cert.pem ]; then
+        cp ~/.cloudflared/cert.pem /etc/cloudflared/cert.pem
+        log_success "Cloudflare 认证完成"
+    else
+        log_error "认证失败"
+        return 1
+    fi
+}
+
+# 创建隧道
+create_tunnel() {
+    log_step "创建 Cloudflare 隧道..."
+    
+    TUNNEL_OUTPUT=$(/usr/local/bin/cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
+    TUNNEL_ID=$(echo "$TUNNEL_OUTPUT" | grep -oP 'Created tunnel \K[a-f0-9-]+')
+    
+    if [ -z "$TUNNEL_ID" ]; then
+        log_error "创建隧道失败"
+        return 1
+    fi
+    
+    echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
+    
+    CRED_FILE=$(echo "$TUNNEL_OUTPUT" | grep -oP '/[^ ]+\.json' | head -1)
+    if [ -f "$CRED_FILE" ]; then
+        cp "$CRED_FILE" /etc/cloudflared/${TUNNEL_ID}.json
+    fi
+    
+    log_success "隧道创建完成: $TUNNEL_ID"
+}
+
+# 配置 DNS
+configure_dns() {
+    log_step "配置 DNS 记录..."
+    /usr/local/bin/cloudflared tunnel route dns "$TUNNEL_ID" "$CF_DOMAIN" 2>/dev/null || true
+    log_success "DNS 记录配置完成"
+}
+
+# 启动服务
+start_services() {
+    log_step "启动服务..."
+    systemctl start xray
+    sleep 2
+    systemctl start cloudflared
+    sleep 2
+    
+    if systemctl is-active --quiet xray && systemctl is-active --quiet cloudflared; then
+        log_success "所有服务启动成功"
+    else
+        log_warn "部分服务启动失败，请检查日志"
+    fi
+}
+
+# 停止服务
+stop_services() {
+    log_step "停止服务..."
+    systemctl stop cloudflared 2>/dev/null || true
+    systemctl stop xray 2>/dev/null || true
+    log_success "服务已停止"
+}
+
+# 重启服务
+restart_services() {
+    log_step "重启服务..."
+    systemctl restart xray
+    systemctl restart cloudflared
+    log_success "服务已重启"
+}
+
+# 显示配置信息
+show_config() {
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}节点配置信息${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}【Xray 配置】${NC}"
+    echo "  UUID:     ${UUID}"
+    echo "  端口：     ${XRAY_PORT}"
+    echo "  路径：     /${WS_PATH}"
+    echo ""
+    echo -e "${CYAN}【Cloudflare 配置】${NC}"
+    echo "  域名：     ${CF_DOMAIN}"
+    echo "  隧道 ID:   ${TUNNEL_ID}"
+    echo ""
+    echo -e "${CYAN}【客户端配置】${NC}"
+    echo "  地址：     ${CF_DOMAIN}"
+    echo "  端口：     443"
+    echo "  协议：     vmess"
+    echo "  传输：     ws+tls"
+    echo "  路径：     /${WS_PATH}"
+    echo "  UUID:      ${UUID}"
+    echo ""
+    
+    # 生成 vmess 链接
+    local VMESS_JSON="{\"v\":\"2\",\"ps\":\"CF-Argo\",\"add\":\"${CF_DOMAIN}\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${CF_DOMAIN}\",\"path\":\"/${WS_PATH}\",\"tls\":\"tls\"}"
+    local VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
+    
+    echo -e "${CYAN}【vmess 链接】${NC}"
+    echo "  $VMESS_LINK"
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# 显示状态
+show_status() {
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}服务状态${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Xray 状态
+    if [ "$XRAY_INSTALLED" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Xray-core:     已安装 (${XRAY_VERSION})"
+    else
+        echo -e "  ${RED}✗${NC} Xray-core:     未安装"
+    fi
+    
+    if [ "$XRAY_RUNNING" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Xray 服务：    运行中"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Xray 服务：    未运行"
+    fi
+    
+    # cloudflared 状态
+    if [ "$CF_INSTALLED" = true ]; then
+        echo -e "  ${GREEN}✓${NC} cloudflared:   已安装 (${CF_VERSION})"
+    else
+        echo -e "  ${RED}✗${NC} cloudflared:   未安装"
+    fi
+    
+    if [ "$CF_RUNNING" = true ]; then
+        echo -e "  ${GREEN}✓${NC} Tunnel 服务：  运行中"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Tunnel 服务：  未运行"
+    fi
+    
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# 查看日志
+view_logs() {
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}日志查看${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  1) Xray 日志"
+    echo "  2) cloudflared 日志"
+    echo "  3) Xray 错误日志"
+    echo "  4) 返回主菜单"
+    echo ""
+    echo -n "  请选择 (1-4): "
+    read LOG_OPTION
+    
+    case $LOG_OPTION in
+        1)
+            echo ""
+            echo -e "${CYAN}【Xray 访问日志 - 最后 20 行】${NC}"
+            tail -20 /var/log/xray/access.log 2>/dev/null || echo "日志文件不存在"
+            ;;
+        2)
+            echo ""
+            echo -e "${CYAN}【cloudflared 日志 - 最后 20 行】${NC}"
+            journalctl -u cloudflared -n 20 --no-pager 2>/dev/null || echo "日志不可用"
+            ;;
+        3)
+            echo ""
+            echo -e "${CYAN}【Xray 错误日志 - 最后 20 行】${NC}"
+            tail -20 /var/log/xray/error.log 2>/dev/null || echo "日志文件不存在"
+            ;;
+        4)
+            return
+            ;;
+        *)
+            log_warn "无效选项"
+            ;;
+    esac
+    
+    echo ""
+    echo -n "  按回车键返回..."
+    read
+}
+
+# 更新组件
+update_components() {
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}组件更新${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  1) 更新 Xray-core"
+    echo "  2) 更新 cloudflared"
+    echo "  3) 更新全部"
+    echo "  4) 返回主菜单"
+    echo ""
+    echo -n "  请选择 (1-4): "
+    read UPDATE_OPTION
+    
+    case $UPDATE_OPTION in
+        1)
+            log_step "更新 Xray-core..."
+            stop_services
+            install_xray
+            start_services
+            log_success "Xray-core 更新完成"
+            ;;
+        2)
+            log_step "更新 cloudflared..."
+            systemctl stop cloudflared
+            install_cloudflared
+            systemctl start cloudflared
+            log_success "cloudflared 更新完成"
+            ;;
+        3)
+            log_step "更新全部组件..."
+            stop_services
+            install_xray
+            install_cloudflared
+            start_services
+            log_success "全部组件更新完成"
+            ;;
+        4)
+            return
+            ;;
+        *)
+            log_warn "无效选项"
+            ;;
+    esac
+    
+    echo ""
+    echo -n "  按回车键返回..."
+    read
+}
+
+# 一键卸载
+uninstall_all() {
+    echo ""
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}⚠  警告：此操作将卸载所有组件并删除配置${NC}"
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -n "  确定要卸载吗？(输入 yes 确认): "
+    read CONFIRM
+    
+    if [ "$CONFIRM" != "yes" ]; then
+        log_info "取消卸载"
+        return
+    fi
+    
+    echo ""
+    log_step "开始卸载..."
+    
+    # 停止服务
+    echo "  [1/6] 停止服务..."
+    systemctl stop cloudflared 2>/dev/null || true
+    systemctl stop xray 2>/dev/null || true
+    
+    # 禁用服务
+    echo "  [2/6] 禁用服务..."
+    systemctl disable cloudflared 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    
+    # 删除服务文件
+    echo "  [3/6] 删除服务文件..."
+    rm -f /etc/systemd/system/xray.service
+    rm -f /etc/systemd/system/cloudflared.service
+    
+    # 删除程序文件
+    echo "  [4/6] 删除程序文件..."
+    rm -f /usr/local/bin/xray
+    rm -f /usr/local/bin/xray-core
+    rm -f /usr/local/bin/cloudflared
+    
+    # 删除配置目录
+    echo "  [5/6] 删除配置目录..."
+    rm -rf /etc/xray
+    rm -rf /etc/cloudflared
+    rm -rf /var/log/xray
+    rm -rf /var/log/cloudflared
+    
+    # 清理 Cloudflare 认证
+    echo "  [6/6] 清理认证信息..."
+    rm -rf ~/.cloudflared
+    
+    # 重载 systemd
+    systemctl daemon-reload
+    
+    echo ""
+    log_success "卸载完成！"
+    echo ""
+    echo -e "${YELLOW}以下文件可能需要手动清理:${NC}"
+    echo "  - Cloudflare DNS 记录（在 Cloudflare 后台删除）"
+    echo "  - Cloudflare Tunnel（在 Zero Trust 后台删除）"
+    echo ""
+    
+    echo -n "  按回车键返回..."
+    read
+}
+
+# 全新部署
+full_deploy() {
+    echo ""
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}全新部署${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # 检查是否已安装
+    if [ "$XRAY_INSTALLED" = true ] || [ "$CF_INSTALLED" = true ]; then
+        log_warn "检测到已有组件安装"
+        echo -n "  是否继续？(y/n): "
+        read CONTINUE
+        if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
+            return
+        fi
+    fi
+    
+    echo ""
+    echo -e "${CYAN}请输入配置信息:${NC}"
+    echo ""
+    
+    # 用户输入
+    echo -n "  Cloudflare 域名 (例如：app.example.com): "
+    read CF_DOMAIN
+    
+    echo -n "  Xray 监听端口 (默认：10000): "
+    read XRAY_PORT_INPUT
+    XRAY_PORT=${XRAY_PORT_INPUT:-10000}
+    
+    echo -n "  WS 路径 (默认：ray): "
+    read WS_PATH_INPUT
+    WS_PATH=${WS_PATH_INPUT:-ray}
+    
+    echo -n "  隧道名称 (默认：my-tunnel): "
+    read TUNNEL_NAME_INPUT
+    TUNNEL_NAME=${TUNNEL_NAME_INPUT:-my-tunnel}
+    
+    echo -n "  UUID (留空自动生成): "
+    read UUID_INPUT
+    if [ -z "$UUID_INPUT" ]; then
+        UUID=$(generate_uuid)
+        log_info "自动生成 UUID"
+    else
+        UUID=$UUID_INPUT
+    fi
+    
+    echo ""
+    log_step "开始部署..."
+    echo ""
+    
+    # 执行部署
+    detect_system
+    detect_package_manager
+    install_dependencies
+    install_xray
+    install_cloudflared
+    create_xray_config
+    cloudflare_auth
+    create_tunnel
+    create_cloudflared_config
+    configure_dns
+    create_systemd_services
+    start_services
+    
+    echo ""
+    show_config
+    
+    echo ""
+    log_success "部署完成！"
+    echo ""
+    echo -n "  按回车键返回..."
+    read
+}
+
+# 主菜单
+main_menu() {
+    while true; do
+        show_banner
+        
+        # 刷新状态
+        check_installation_status
+        
+        echo -e "  ${CYAN}系统信息:${NC}"
+        echo "    系统：$OS_PRETTY | 架构：$ARCH"
+        echo ""
+        
+        echo -e "  ${CYAN}安装状态:${NC}"
+        if [ "$XRAY_INSTALLED" = true ]; then
+            echo -e "    Xray-core:     ${GREEN}已安装${NC} ${XRAY_VERSION}"
+        else
+            echo -e "    Xray-core:     ${RED}未安装${NC}"
+        fi
+        
+        if [ "$CF_INSTALLED" = true ]; then
+            echo -e "    cloudflared:   ${GREEN}已安装${NC} ${CF_VERSION}"
+        else
+            echo -e "    cloudflared:   ${RED}未安装${NC}"
+        fi
+        
+        echo ""
+        echo -e "  ${CYAN}运行状态:${NC}"
+        if [ "$XRAY_RUNNING" = true ]; then
+            echo -e "    Xray 服务：    ${GREEN}运行中${NC}"
+        else
+            echo -e "    Xray 服务：    ${YELLOW}未运行${NC}"
+        fi
+        
+        if [ "$CF_RUNNING" = true ]; then
+            echo -e "    Tunnel 服务：  ${GREEN}运行中${NC}"
+        else
+            echo -e "    Tunnel 服务：  ${YELLOW}未运行${NC}"
+        fi
+        
+        echo ""
+        echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "  ${WHITE}主菜单${NC}"
+        echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo "    1) 全新部署"
+        echo "    2) 查看配置"
+        echo "    3) 查看状态"
+        echo "    4) 启动服务"
+        echo "    5) 停止服务"
+        echo "    6) 重启服务"
+        echo "    7) 查看日志"
+        echo "    8) 更新组件"
+        echo "    9) 一键卸载"
+        echo "    0) 退出脚本"
+        echo ""
+        echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo -n "  请选择 (0-9): "
+        read OPTION
+        
+        case $OPTION in
+            1)
+                full_deploy
+                ;;
+            2)
+                if [ -n "$UUID" ]; then
+                    show_config
+                    echo -n "  按回车键返回..."
+                    read
+                else
+                    log_warn "未找到配置信息"
+                    echo -n "  按回车键返回..."
+                    read
+                fi
+                ;;
+            3)
+                show_status
+                echo -n "  按回车键返回..."
+                read
+                ;;
+            4)
+                start_services
+                echo -n "  按回车键返回..."
+                read
+                ;;
+            5)
+                stop_services
+                echo -n "  按回车键返回..."
+                read
+                ;;
+            6)
+                restart_services
+                echo -n "  按回车键返回..."
+                read
+                ;;
+            7)
+                view_logs
+                ;;
+            8)
+                update_components
+                ;;
+            9)
+                uninstall_all
+                ;;
+            0)
+                echo ""
+                log_info "感谢使用，再见！"
+                echo ""
+                exit 0
+                ;;
+            *)
+                log_warn "无效选项，请重新选择"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# 程序入口
+main() {
+    check_root
+    detect_system
+    detect_package_manager
+    check_installation_status
+    main_menu
+}
+
+# 运行
+main "$@"
