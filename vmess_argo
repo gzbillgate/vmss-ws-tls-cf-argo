@@ -2,11 +2,10 @@
 
 #=============================================================================
 #  Xray + Cloudflare Argo Tunnel 一键部署管理脚本
-#  版本：v2.7 (xray-core 文件修复版)
-#  修复：Xray v26.x.x 不再包含 xray-core 文件
+#  版本：v2.9 (Token 认证版)
+#  特点：支持 Token 认证，无需浏览器
 #=============================================================================
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,8 +14,7 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 全局变量
-SCRIPT_VERSION="2.7"
+SCRIPT_VERSION="2.9"
 XRAY_VERSION=""
 CF_VERSION=""
 UUID=""
@@ -25,11 +23,11 @@ XRAY_PORT=""
 CF_DOMAIN=""
 TUNNEL_ID=""
 TUNNEL_NAME=""
+TUNNEL_TOKEN=""
 OS_PRETTY=""
 ARCH=""
 ARCH_NAME=""
 
-# 日志函数
 log_info() { echo -e "${GREEN}[✓ INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[⚠ WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[✗ ERROR]${NC} $1"; }
@@ -102,6 +100,7 @@ check_installation_status() {
         CF_DOMAIN=$(grep 'hostname:' /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}' || echo "")
         TUNNEL_ID=$(cat /etc/cloudflared/tunnel-id 2>/dev/null || echo "")
     }
+    [ -f /etc/cloudflared/token ] && TUNNEL_TOKEN=$(cat /etc/cloudflared/token 2>/dev/null || echo "")
 }
 
 install_dependencies() {
@@ -111,7 +110,6 @@ install_dependencies() {
     log_success "依赖安装完成"
 }
 
-# 【修复】Xray v26.x.x 不再包含 xray-core 文件
 install_xray() {
     log_step "安装 Xray-core..."
     cd /tmp
@@ -124,8 +122,6 @@ install_xray() {
     
     local FILENAME="Xray-linux-${ARCH}.zip"
     local DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${FILENAME}"
-    
-    log_info "下载文件：$FILENAME"
     
     local MIRRORS=(
         "$DOWNLOAD_URL"
@@ -161,15 +157,10 @@ install_xray() {
     unzip -q -o xray.zip
     mkdir -p /etc/xray /var/log/xray
     
-    # 【修复】只处理存在的文件
     chmod +x xray 2>/dev/null || true
     mv -f xray /usr/local/bin/xray 2>/dev/null || true
-    
-    # xray-core 文件在 v26.x.x 中已不存在
-    if [ -f xray-core ]; then
-        chmod +x xray-core 2>/dev/null || true
-        mv -f xray-core /usr/local/bin/xray-core 2>/dev/null || true
-    fi
+    [ -f xray-core ] && chmod +x xray-core 2>/dev/null || true
+    [ -f xray-core ] && mv -f xray-core /usr/local/bin/xray-core 2>/dev/null || true
     
     mv -f geoip.dat /etc/xray/ 2>/dev/null || true
     mv -f geosite.dat /etc/xray/ 2>/dev/null || true
@@ -282,32 +273,175 @@ EOF
     log_success "Xray 配置文件创建完成"
 }
 
+# 【修复】使用 Token 认证，无需浏览器
+cloudflare_auth_token() {
+    log_step "Cloudflare Token 认证..."
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${WHITE}Cloudflare Token 认证（无需浏览器）${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  获取 Token 步骤："
+    echo "  1. 访问 Cloudflare Zero Trust: https://one.dash.cloudflare.com/"
+    echo "  2. 进入 Access → Tunnels"
+    echo "  3. 创建新 Tunnel"
+    echo "  4. 选择 your operating system"
+    echo "  5. 复制 Token（以 eyJ 开头的长字符串）"
+    echo ""
+    echo -n "  请输入 Token: "
+    read TUNNEL_TOKEN
+    
+    if [ -z "$TUNNEL_TOKEN" ]; then
+        log_error "Token 不能为空"
+        return 1
+    fi
+    
+    # 保存 Token
+    mkdir -p /etc/cloudflared
+    echo "$TUNNEL_TOKEN" > /etc/cloudflared/token
+    chmod 600 /etc/cloudflared/token
+    
+    # 使用 Token 创建隧道配置
+    log_progress "配置隧道..."
+    /usr/local/bin/cloudflared service install "$TUNNEL_TOKEN" 2>/dev/null || {
+        # 如果 service install 失败，手动配置
+        log_warn "service install 失败，使用手动配置"
+        
+        # 从 token 中提取 tunnel ID
+        TUNNEL_ID=$(echo "$TUNNEL_TOKEN" | base64 -d 2>/dev/null | grep -oP '"tunnel_id":"\K[a-f0-9-]+' || echo "")
+        
+        if [ -z "$TUNNEL_ID" ]; then
+            # 尝试另一种方式获取
+            TUNNEL_ID=$(echo "$TUNNEL_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | grep -oP 'tunnel_id.*?' | head -1 || echo "")
+        fi
+        
+        echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
+        log_info "Tunnel ID: $TUNNEL_ID"
+    }
+    
+    log_success "Token 认证完成"
+}
+
+cloudflare_auth_browser() {
+    log_step "Cloudflare 浏览器认证..."
+    echo ""
+    echo "  即将运行认证命令，会自动打开浏览器或输出 URL..."
+    echo ""
+    echo -n "  按回车键继续..."
+    read
+    
+    /usr/local/bin/cloudflared tunnel login
+    
+    if [ -f ~/.cloudflared/cert.pem ]; then
+        cp ~/.cloudflared/cert.pem /etc/cloudflared/cert.pem
+        log_success "Cloudflare 认证完成"
+    else
+        log_error "认证失败"
+        return 1
+    fi
+}
+
+create_tunnel() {
+    log_step "创建 Cloudflare 隧道..."
+    
+    # 如果已有 token，不需要创建隧道
+    if [ -n "$TUNNEL_TOKEN" ]; then
+        log_info "使用 Token 配置，跳过隧道创建"
+        return 0
+    fi
+    
+    /usr/local/bin/cloudflared tunnel delete "$TUNNEL_NAME" 2>/dev/null || true
+    
+    TUNNEL_OUTPUT=$(/usr/local/bin/cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
+    TUNNEL_ID=$(echo "$TUNNEL_OUTPUT" | grep -oP 'Created tunnel \K[a-f0-9-]+' || echo "")
+    
+    if [ -z "$TUNNEL_ID" ]; then
+        log_error "创建隧道失败"
+        return 1
+    fi
+    
+    echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
+    CRED_FILE=$(echo "$TUNNEL_OUTPUT" | grep -oP '/[^ ]+\.json' | head -1 || echo "")
+    [ -n "$CRED_FILE" ] && [ -f "$CRED_FILE" ] && cp "$CRED_FILE" /etc/cloudflared/${TUNNEL_ID}.json
+    
+    log_success "隧道创建完成：$TUNNEL_ID"
+}
+
 create_cloudflared_config() {
     log_step "创建 cloudflared 配置文件..."
     mkdir -p /etc/cloudflared
-    cat > /etc/cloudflared/config.yml << EOF
+    
+    # 如果有 token，使用 token 方式
+    if [ -n "$TUNNEL_TOKEN" ]; then
+        cat > /etc/cloudflared/config.yml << EOF
 tunnel: ${TUNNEL_ID}
-credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
 
 metrics: 0.0.0.0:2000
 no-autoupdate: true
-logfile: /var/log/cloudflared/tunnel.log
-loglevel: info
-
-originRequest:
-  connectTimeout: 30s
-  keepAliveConnections: 100
 
 ingress:
   - hostname: ${CF_DOMAIN}
     service: http://localhost:${XRAY_PORT}
   - service: http_status:404
 EOF
+    else
+        cat > /etc/cloudflared/config.yml << EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+
+metrics: 0.0.0.0:2000
+no-autoupdate: true
+
+ingress:
+  - hostname: ${CF_DOMAIN}
+    service: http://localhost:${XRAY_PORT}
+  - service: http_status:404
+EOF
+    fi
+    
     log_success "cloudflared 配置文件创建完成"
 }
 
 create_systemd_services() {
     log_step "创建 systemd 服务..."
+    
+    # 如果有 token，使用 token 方式启动
+    if [ -n "$TUNNEL_TOKEN" ]; then
+        cat > /etc/systemd/system/cloudflared.service << EOF
+[Unit]
+Description=Cloudflare Tunnel Service
+After=network.target xray.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel run --token ${TUNNEL_TOKEN}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        cat > /etc/systemd/system/cloudflared.service << EOF
+[Unit]
+Description=Cloudflare Tunnel Service
+After=network.target xray.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
     
     cat > /etc/systemd/system/xray.service << EOF
 [Unit]
@@ -326,76 +460,22 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
     
-    cat > /etc/systemd/system/cloudflared.service << EOF
-[Unit]
-Description=Cloudflare Tunnel Service
-After=network.target xray.service
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/cloudflared tunnel run
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
     systemctl daemon-reload
     systemctl enable xray >/dev/null 2>&1 || true
     systemctl enable cloudflared >/dev/null 2>&1 || true
     log_success "systemd 服务创建完成"
 }
 
-cloudflare_auth() {
-    log_step "Cloudflare 认证..."
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo "  请在浏览器打开以下链接认证："
-    echo -e "  ${BLUE}https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/run-tunnel/trycloudflare/${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -n "  完成后按回车继续..."
-    read
-    
-    /usr/local/bin/cloudflared tunnel login
-    
-    if [ -f ~/.cloudflared/cert.pem ]; then
-        cp ~/.cloudflared/cert.pem /etc/cloudflared/cert.pem
-        log_success "Cloudflare 认证完成"
-    else
-        log_error "认证失败"
-        return 1
-    fi
-}
-
-create_tunnel() {
-    log_step "创建 Cloudflare 隧道..."
-    /usr/local/bin/cloudflared tunnel delete "$TUNNEL_NAME" 2>/dev/null || true
-    
-    TUNNEL_OUTPUT=$(/usr/local/bin/cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
-    TUNNEL_ID=$(echo "$TUNNEL_OUTPUT" | grep -oP 'Created tunnel \K[a-f0-9-]+' || echo "")
-    
-    if [ -z "$TUNNEL_ID" ]; then
-        log_error "创建隧道失败"
-        return 1
-    fi
-    
-    echo "$TUNNEL_ID" > /etc/cloudflared/tunnel-id
-    CRED_FILE=$(echo "$TUNNEL_OUTPUT" | grep -oP '/[^ ]+\.json' | head -1 || echo "")
-    [ -n "$CRED_FILE" ] && [ -f "$CRED_FILE" ] && cp "$CRED_FILE" /etc/cloudflared/${TUNNEL_ID}.json
-    
-    log_success "隧道创建完成：$TUNNEL_ID"
-}
-
 configure_dns() {
     log_step "配置 DNS 记录..."
-    /usr/local/bin/cloudflared tunnel route dns "$TUNNEL_ID" "$CF_DOMAIN" 2>/dev/null || {
-        log_warn "DNS 记录创建失败，请在 Cloudflare 后台手动添加"
-    }
-    log_success "DNS 记录配置完成"
+    if [ -z "$TUNNEL_TOKEN" ]; then
+        /usr/local/bin/cloudflared tunnel route dns "$TUNNEL_ID" "$CF_DOMAIN" 2>/dev/null || {
+            log_warn "DNS 记录创建失败，请在 Cloudflare 后台手动添加"
+        }
+    else
+        log_info "Token 模式请在 Cloudflare 后台配置 DNS"
+    fi
+    log_success "DNS 配置完成"
 }
 
 start_services() {
@@ -572,6 +652,13 @@ full_deploy() {
     read UUID_INPUT
     [ -z "$UUID_INPUT" ] && { UUID=$(generate_uuid); log_info "自动生成 UUID"; } || UUID=$UUID_INPUT
     
+    echo ""
+    echo -e "${CYAN}选择认证方式:${NC}"
+    echo "  1) Token 认证（推荐，无需浏览器）"
+    echo "  2) 浏览器认证"
+    echo -n "  请选择 (1-2): "
+    read AUTH_METHOD
+    
     log_step "开始部署..."
     
     detect_system
@@ -580,7 +667,13 @@ full_deploy() {
     install_xray
     install_cloudflared
     create_xray_config
-    cloudflare_auth
+    
+    if [ "$AUTH_METHOD" = "1" ]; then
+        cloudflare_auth_token
+    else
+        cloudflare_auth_browser
+    fi
+    
     create_tunnel
     create_cloudflared_config
     configure_dns
